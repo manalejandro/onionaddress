@@ -1,0 +1,48 @@
+{
+  "name": "onionaddress",
+  "version": "1.0.0",
+  "description": "Vanity address generator for Tor v3 onion services with a probability-aware, multi-core search engine.",
+  "keywords": [
+    "tor",
+    "onion",
+    "onion-address",
+    "vanity-address",
+    "onion-service",
+    "v3",
+    "ed25519",
+    "base32",
+    "security"
+  ],
+  "homepage": "https://github.com/manalejandro/onionaddress#readme",
+  "bugs": {
+    "url": "https://github.com/manalejandro/onionaddress/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/manalejandro/onionaddress.git"
+  },
+  "license": "MIT",
+  "author": "manalejandro",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "bin": {
+    "onionaddress": "src/cli.js"
+  },
+  "files": [
+    "src",
+    "gpu"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/cli.js",
+    "test": "node --test",
+    "benchmark": "node src/cli.js benchmark",
+    "build:cpu": "make -C gpu cpu",
+    "build:cuda": "make -C gpu cuda"
+  }
+}
