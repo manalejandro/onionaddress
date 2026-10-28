@@ -200,9 +200,17 @@ ONION_HD static void onion_sha3_256(const onion_tables *T, const u8 *data,
 
 /* ------------------------------------------------------------------ */
 /* GF(2^255 - 19): eight 32-bit limbs, little-endian, fully reduced    */
+/*                                                                     */
+/* Every operation below is branch-free with a fixed instruction count: */
+/* conditional reductions are done with masked selects instead of       */
+/* comparisons, and carry propagation uses fixed-length loops. On a GPU  */
+/* this matters enormously — data-dependent branches make all 32 lanes   */
+/* of a warp execute both paths serially.                              */
 /* ------------------------------------------------------------------ */
 
 typedef u32 fe[8];
+
+#define FE_P_LIMB(i) ((i) == 0 ? 0xffffffedu : ((i) == 7 ? 0x7fffffffu : 0xffffffffu))
 
 ONION_HD static void fe_zero(fe h) {
   for (u32 i = 0; i < 8; i++) h[i] = 0;
@@ -215,8 +223,7 @@ ONION_HD static void fe_one(fe h) {
 
 /* p = 2^255 - 19 */
 ONION_HD static void fe_p(fe h) {
-  h[0] = 0xffffffed; h[1] = 0xffffffff; h[2] = 0xffffffff; h[3] = 0xffffffff;
-  h[4] = 0xffffffff; h[5] = 0xffffffff; h[6] = 0xffffffff; h[7] = 0x7fffffff;
+  for (u32 i = 0; i < 8; i++) h[i] = FE_P_LIMB(i);
 }
 
 ONION_HD static int fe_is_zero(const fe a) {
@@ -225,7 +232,7 @@ ONION_HD static int fe_is_zero(const fe a) {
   return acc == 0;
 }
 
-/* -1, 0 or 1 comparing as integers */
+/* -1, 0 or 1 comparing as integers (setup-time only) */
 ONION_HD static int fe_cmp(const fe a, const fe b) {
   for (int i = 7; i >= 0; i--) {
     if (a[i] < b[i]) return -1;
@@ -234,7 +241,7 @@ ONION_HD static int fe_cmp(const fe a, const fe b) {
   return 0;
 }
 
-/* h = a - b assuming a >= b */
+/* h = a - b assuming a >= b (setup-time helper) */
 ONION_HD static void fe_sub_raw(fe h, const fe a, const fe b) {
   u64 borrow = 0;
   for (u32 i = 0; i < 8; i++) {
@@ -244,39 +251,7 @@ ONION_HD static void fe_sub_raw(fe h, const fe a, const fe b) {
   }
 }
 
-/* fold an overflow carry of 2^256 into the limbs: 2^256 = 38 (mod p) */
-ONION_HD static void fe_fold_carry(fe h, u64 carry) {
-  while (carry != 0) {
-    u64 v = (u64)h[0] + carry * 38;
-    h[0] = (u32)v;
-    carry = v >> 32;
-    for (u32 i = 1; i < 8 && carry != 0; i++) {
-      u64 w = (u64)h[i] + carry;
-      h[i] = (u32)w;
-      carry = w >> 32;
-    }
-  }
-}
-
-/* reduce to [0, p) */
-ONION_HD static void fe_reduce(fe h) {
-  fe p;
-  fe_p(p);
-  while (fe_cmp(h, p) >= 0) fe_sub_raw(h, h, p);
-}
-
-/* h = a + b (mod p), a, b < p */
-ONION_HD static void fe_add(fe h, const fe a, const fe b) {
-  u64 carry = 0;
-  for (u32 i = 0; i < 8; i++) {
-    u64 t = (u64)a[i] + (u64)b[i] + carry;
-    h[i] = (u32)t;
-    carry = t >> 32;
-  }
-  fe_reduce(h);
-}
-
-/* h = -a (mod p) */
+/* h = -a (mod p) (setup-time helper) */
 ONION_HD static void fe_neg(fe h, const fe a) {
   if (fe_is_zero(a)) {
     fe_zero(h);
@@ -287,57 +262,123 @@ ONION_HD static void fe_neg(fe h, const fe a) {
   fe_sub_raw(h, p, a);
 }
 
-/* h = a - b (mod p), a, b < p */
-ONION_HD static void fe_sub(fe h, const fe a, const fe b) {
-  fe nb;
-  fe_neg(nb, b);
-  fe_add(h, a, nb);
+/* two masked conditional subtractions of p: enough because h < 2^256 = 2p+38 */
+ONION_HD static void fe_reduce2(fe h) {
+  for (u32 pass = 0; pass < 2; pass++) {
+    u32 r[8];
+    u64 borrow = 0;
+    for (u32 i = 0; i < 8; i++) {
+      const u64 d = (u64)h[i] - (u64)FE_P_LIMB(i) - borrow;
+      r[i] = (u32)d;
+      borrow = (d >> 32) & 1;
+    }
+    const u32 mask = (u32)borrow - 1u; /* borrow=1 -> keep h, borrow=0 -> take r */
+    for (u32 i = 0; i < 8; i++) h[i] = (h[i] & ~mask) | (r[i] & mask);
+  }
 }
 
-ONION_HD static void fe_mul_wide(const fe a, const fe b, u32 t[16]) {
+/* h = a + b (mod p), a, b < p; branch-free (a+b < 2p < 2^256) */
+ONION_HD static void fe_add(fe h, const fe a, const fe b) {
+  u32 t[8];
+  u64 carry = 0;
+  for (u32 i = 0; i < 8; i++) {
+    const u64 s = (u64)a[i] + (u64)b[i] + carry;
+    t[i] = (u32)s;
+    carry = s >> 32;
+  }
+
+  u32 r[8];
+  u64 borrow = 0;
+  for (u32 i = 0; i < 8; i++) {
+    const u64 d = (u64)t[i] - (u64)FE_P_LIMB(i) - borrow;
+    r[i] = (u32)d;
+    borrow = (d >> 32) & 1;
+  }
+  const u32 mask = (u32)borrow - 1u;
+  for (u32 i = 0; i < 8; i++) h[i] = (t[i] & ~mask) | (r[i] & mask);
+}
+
+/* h = a - b (mod p), a, b < p; branch-free (adds p back when a < b) */
+ONION_HD static void fe_sub(fe h, const fe a, const fe b) {
+  u32 t[8];
+  u64 borrow = 0;
+  for (u32 i = 0; i < 8; i++) {
+    const u64 d = (u64)a[i] - (u64)b[i] - borrow;
+    t[i] = (u32)d;
+    borrow = (d >> 32) & 1;
+  }
+
+  const u32 mask = (u32)(0 - borrow); /* borrow=1 -> add p */
+  u64 carry = 0;
+  for (u32 i = 0; i < 8; i++) {
+    const u64 s = (u64)t[i] + ((u32)FE_P_LIMB(i) & mask) + carry;
+    h[i] = (u32)s;
+    carry = s >> 32;
+  }
+}
+
+/* h = a * b (mod p): schoolbook product, then fold 2^256 -> 38, then reduce */
+ONION_HD static void fe_mul(fe h, const fe a, const fe b) {
+  u32 t[16];
   for (u32 i = 0; i < 16; i++) t[i] = 0;
+
   for (u32 i = 0; i < 8; i++) {
     u64 carry = 0;
     for (u32 j = 0; j < 8; j++) {
-      u64 sum = (u64)t[i + j] + (u64)a[i] * (u64)b[j] + carry;
-      t[i + j] = (u32)sum;
-      carry = sum >> 32;
+      const u64 s = (u64)t[i + j] + (u64)a[i] * (u64)b[j] + carry;
+      t[i + j] = (u32)s;
+      carry = s >> 32;
     }
-    u32 k = i + 8;
-    while (carry != 0 && k < 16) {
-      u64 sum = (u64)t[k] + carry;
-      t[k] = (u32)sum;
-      carry = sum >> 32;
-      k++;
+    for (u32 k = i + 8; k < 16; k++) {
+      const u64 s = (u64)t[k] + carry;
+      t[k] = (u32)s;
+      carry = s >> 32;
     }
   }
-}
-
-/* h = a * b (mod p) */
-ONION_HD static void fe_mul(fe h, const fe a, const fe b) {
-  u32 t[16];
-  fe_mul_wide(a, b, t);
 
   u64 carry = 0;
   for (u32 i = 0; i < 8; i++) {
-    u64 v = (u64)t[i] + (u64)t[i + 8] * 38 + carry;
+    const u64 v = (u64)t[i] + (u64)t[i + 8] * 38 + carry;
     h[i] = (u32)v;
     carry = v >> 32;
   }
-  fe_fold_carry(h, carry);
-  fe_reduce(h);
+
+  /* fold the leftover carry (bounded by ~39) three times; each pass shrinks it */
+  for (u32 pass = 0; pass < 3; pass++) {
+    u64 c = carry * 38;
+    carry = 0;
+    for (u32 i = 0; i < 8; i++) {
+      const u64 s = (u64)h[i] + c;
+      h[i] = (u32)s;
+      c = s >> 32;
+    }
+    carry = c;
+  }
+
+  fe_reduce2(h);
 }
 
 /* h = a * small (mod p), small < 2^32 */
 ONION_HD static void fe_mul_small(fe h, const fe a, u32 small) {
+  u32 t[8];
   u64 carry = 0;
   for (u32 i = 0; i < 8; i++) {
-    u64 v = (u64)a[i] * small + carry;
-    h[i] = (u32)v;
+    const u64 v = (u64)a[i] * small + carry;
+    t[i] = (u32)v;
     carry = v >> 32;
   }
-  fe_fold_carry(h, carry);
-  fe_reduce(h);
+  for (u32 pass = 0; pass < 3; pass++) {
+    u64 c = carry * 38;
+    carry = 0;
+    for (u32 i = 0; i < 8; i++) {
+      const u64 s = (u64)t[i] + c;
+      t[i] = (u32)s;
+      c = s >> 32;
+    }
+    carry = c;
+  }
+  for (u32 i = 0; i < 8; i++) h[i] = t[i];
+  fe_reduce2(h);
 }
 
 ONION_HD static void fe_sq(fe h, const fe a) {
@@ -379,6 +420,28 @@ ONION_HD static void fe_invert(fe h, const fe a) {
   fe_mul(h, t0, z11);                                          /* 2^255-21 */
 }
 
+/*
+ * Batch inversion (Montgomery's trick): n inversions for the price of one
+ * fe_invert plus 3n multiplications. Used to build the comb table.
+ * `in` and `out` must not alias.
+ */
+ONION_HD static void fe_batch_invert(fe *out, const fe *in, u32 n) {
+  if (n == 0) return;
+  for (u32 i = 0; i < 8; i++) out[0][i] = in[0][i];
+  for (u32 i = 1; i < n; i++) fe_mul(out[i], out[i - 1], in[i]);
+
+  fe u;
+  fe_invert(u, out[n - 1]);
+
+  for (u32 i = n; i-- > 1;) {
+    fe inv_i;
+    fe_mul(inv_i, u, out[i - 1]); /* 1/z_i = u * P_{i-1} */
+    fe_mul(u, u, in[i]);          /* u <- 1/P_{i-1}       */
+    for (u32 k = 0; k < 8; k++) out[i][k] = inv_i[k];
+  }
+  for (u32 k = 0; k < 8; k++) out[0][k] = u[k];
+}
+
 /* h = a^e for an arbitrary exponent (8 little-endian limbs).
  * Square-and-multiply; used only for one-time setup. */
 ONION_HD static void fe_exp_simple(fe h, const fe a, const u32 e[8]) {
@@ -399,17 +462,24 @@ typedef struct {
   fe X, Y, Z, T;
 } ge;
 
-typedef struct {
-  fe X, Y;  /* affine coordinates (Z = 1) */
-  fe T;     /* X * Y */
-  fe T2;    /* 2*d*X*Y, precomputed for madd */
-} ge_aff;
+#define COMB_WINDOWS 32
+#define COMB_ENTRIES 256
 
-#define COMB_WINDOWS 64
-#define COMB_ENTRIES 16
-
+/*
+ * Fixed-base comb table: window w holds the points n * 16^w * B (n = 0..15) in
+ * affine form (Z = 1), plus T = X*Y and T2 = 2d*X*Y for the madd formula.
+ *
+ * Layout is structure-of-arrays on purpose: for a fixed window/coordinate/limb
+ * the entries are contiguous, so the 32 lanes of a warp read 32 adjacent u32
+ * values (one or two 32-byte sectors) instead of 32 scattered 128-byte cache
+ * lines. With the naive array-of-structs layout the kernel is memory bound and
+ * the arithmetic is nearly free; SoA removes ~32x of the memory transactions.
+ */
 typedef struct {
-  ge_aff e[COMB_WINDOWS * COMB_ENTRIES];
+  u32 X[COMB_WINDOWS][8][COMB_ENTRIES];
+  u32 Y[COMB_WINDOWS][8][COMB_ENTRIES];
+  u32 T[COMB_WINDOWS][8][COMB_ENTRIES];
+  u32 T2[COMB_WINDOWS][8][COMB_ENTRIES];
 } comb_table;
 
 /*
@@ -444,19 +514,19 @@ ONION_HD static void ge_add(ge *r, const ge *p, const ge *q, const fe d2) {
   fe_mul(r->Z, f, g);
 }
 
-/* madd: q is affine with precomputed q->T2 = 2*d*q->X*q->Y */
-ONION_HD static void ge_madd(ge *r, const ge *p, const ge_aff *q) {
+/* mixed addition: q affine (Z = 1) with precomputed qT2 = 2d*Xq*Yq */
+ONION_HD static void ge_madd_aff(ge *r, const ge *p, const fe qX, const fe qY, const fe qT2) {
   fe a, b, c, d, e, f, g, h, t;
 
   fe_sub(a, p->Y, p->X);
-  fe_sub(t, q->Y, q->X);
+  fe_sub(t, qY, qX);
   fe_mul(a, a, t);
 
   fe_add(b, p->Y, p->X);
-  fe_add(t, q->Y, q->X);
+  fe_add(t, qY, qX);
   fe_mul(b, b, t);
 
-  fe_mul(c, p->T, q->T2);
+  fe_mul(c, p->T, qT2);
 
   fe_add(d, p->Z, p->Z);
 
@@ -469,6 +539,17 @@ ONION_HD static void ge_madd(ge *r, const ge *p, const ge_aff *q) {
   fe_mul(r->Y, g, h);
   fe_mul(r->T, e, h);
   fe_mul(r->Z, f, g);
+}
+
+/* madd against a comb table entry (loads the entry with coalesced accesses) */
+ONION_HD static void ge_madd_tab(ge *r, const ge *p, const comb_table *table, u32 w, u32 n) {
+  fe qX, qY, qT2;
+  for (u32 i = 0; i < 8; i++) {
+    qX[i] = table->X[w][i][n];
+    qY[i] = table->Y[w][i][n];
+    qT2[i] = table->T2[w][i][n];
+  }
+  ge_madd_aff(r, p, qX, qY, qT2);
 }
 
 /*
@@ -530,19 +611,27 @@ ONION_HD static int onion_curve_init(fe d2, ge *B) {
 }
 
 /*
- * Fill one comb window: entry [w][n] = n * 16^w * B as affine coordinates
- * plus T2 = 2d*X*Y. Entry [w][0] is the neutral element (0, 1).
+ * Fill one comb window: entry [w][n] = n * 256^w * B in affine form, plus
+ * T = X*Y and T2 = 2d*X*Y for the mixed addition. Entry [w][0] is the neutral
+ * element (0 : 1).
+ *
+ * The 255 points are chained with mixed additions and converted to affine in
+ * chunks, so each chunk pays one fe_invert (via fe_batch_invert) instead of
+ * one per entry.
  */
+#define COMB_INIT_CHUNK 32
+
 ONION_HD static void onion_comb_init_window(comb_table *table, u32 w,
                                             const fe d2, const ge *B) {
-  ge_aff *base = &table->e[w * COMB_ENTRIES];
+  /* entry 0 is the neutral element (0 : 1 : 1 : 0) */
+  for (u32 i = 0; i < 8; i++) {
+    table->X[w][i][0] = 0;
+    table->Y[w][i][0] = (i == 0) ? 1u : 0u;
+    table->T[w][i][0] = 0;
+    table->T2[w][i][0] = 0;
+  }
 
-  fe_zero(base->X);
-  fe_one(base->Y);
-  fe_zero(base->T);
-  fe_zero(base->T2);
-
-  /* G_w = 16^w * B (four doublings per window) */
+  /* G_w = 256^w * B (eight doublings per window) */
   ge G;
   for (u32 i = 0; i < 8; i++) {
     G.X[i] = B->X[i];
@@ -551,23 +640,50 @@ ONION_HD static void onion_comb_init_window(comb_table *table, u32 w,
     G.T[i] = B->T[i];
   }
   for (u32 i = 0; i < w; i++) {
-    ge_add(&G, &G, &G, d2);
-    ge_add(&G, &G, &G, d2);
-    ge_add(&G, &G, &G, d2);
-    ge_add(&G, &G, &G, d2);
+    for (u32 k = 0; k < 8; k++) ge_add(&G, &G, &G, d2);
   }
 
-  /* P_n = n * G_w for n = 1..15 */
+  /* affine G, so the chain below can use mixed additions */
+  fe ginv, gx, gy, gt, gt2;
+  fe_invert(ginv, G.Z);
+  fe_mul(gx, G.X, ginv);
+  fe_mul(gy, G.Y, ginv);
+  fe_mul(gt, gx, gy);
+  fe_mul(gt2, gt, d2);
+
+  fe cx[COMB_INIT_CHUNK], cy[COMB_INIT_CHUNK], cz[COMB_INIT_CHUNK], cinv[COMB_INIT_CHUNK];
   ge P = G;
+  u32 c = 0;
+
   for (u32 n = 1; n < COMB_ENTRIES; n++) {
-    ge_aff *entry = &base[n];
-    fe zin;
-    fe_invert(zin, P.Z);
-    fe_mul(entry->X, P.X, zin);
-    fe_mul(entry->Y, P.Y, zin);
-    fe_mul(entry->T, entry->X, entry->Y);
-    fe_mul(entry->T2, entry->T, d2);
-    if (n + 1 < COMB_ENTRIES) ge_add(&P, &P, &G, d2);
+    for (u32 i = 0; i < 8; i++) {
+      cx[c][i] = P.X[i];
+      cy[c][i] = P.Y[i];
+      cz[c][i] = P.Z[i];
+    }
+    c++;
+
+    if (c == COMB_INIT_CHUNK || n == COMB_ENTRIES - 1) {
+      fe_batch_invert(cinv, cz, c);
+      const u32 first = n - c + 1;
+      for (u32 k = 0; k < c; k++) {
+        fe x, y, t, t2;
+        fe_mul(x, cx[k], cinv[k]);
+        fe_mul(y, cy[k], cinv[k]);
+        fe_mul(t, x, y);
+        fe_mul(t2, t, d2);
+        const u32 idx = first + k;
+        for (u32 i = 0; i < 8; i++) {
+          table->X[w][i][idx] = x[i];
+          table->Y[w][i][idx] = y[i];
+          table->T[w][i][idx] = t[i];
+          table->T2[w][i][idx] = t2[i];
+        }
+      }
+      c = 0;
+    }
+
+    if (n + 1 < COMB_ENTRIES) ge_madd_aff(&P, &P, gx, gy, gt2);
   }
 }
 
@@ -579,28 +695,28 @@ ONION_HD static int onion_comb_init(comb_table *table) {
   return 0;
 }
 
-/* r = scalar * B using the comb table; scalar is 32 little-endian bytes */
+/* r = scalar * B using the comb table; scalar is 32 little-endian bytes.
+ * One 8-bit window per byte: 31 mixed additions instead of 63 with 4-bit
+ * windows, which is the single biggest saving in the whole pipeline. */
 ONION_HD static void comb_mult(ge *r, const u8 scalar[32], const comb_table *table) {
-  const ge_aff *first = &table->e[scalar[0] & 15];
+  const u32 d0 = scalar[0];
   for (u32 i = 0; i < 8; i++) {
-    r->X[i] = first->X[i];
-    r->Y[i] = first->Y[i];
-    r->T[i] = first->T[i];
+    r->X[i] = table->X[0][i][d0];
+    r->Y[i] = table->Y[0][i][d0];
+    r->T[i] = table->T[0][i][d0];
   }
   fe_one(r->Z);
 
   for (u32 w = 1; w < COMB_WINDOWS; w++) {
-    const u32 nibble = (scalar[w >> 1] >> (4 * (w & 1))) & 15;
-    ge_madd(r, r, &table->e[w * COMB_ENTRIES + nibble]);
+    ge_madd_tab(r, r, table, w, scalar[w]);
   }
 }
 
 /* compress r to the 32-byte Ed25519 public key encoding */
-ONION_HD static void ge_compress(const ge *p, u8 out[32]) {
-  fe zin, x, y;
-  fe_invert(zin, p->Z);
-  fe_mul(x, p->X, zin);
-  fe_mul(y, p->Y, zin);
+ONION_HD static void ge_compress_inv(const ge *p, const fe zinv, u8 out[32]) {
+  fe x, y;
+  fe_mul(x, p->X, zinv);
+  fe_mul(y, p->Y, zinv);
 
   for (u32 i = 0; i < 32; i++) {
     out[i] = (u8)(y[i >> 2] >> (8 * (i & 3)));
@@ -608,14 +724,87 @@ ONION_HD static void ge_compress(const ge *p, u8 out[32]) {
   out[31] = (u8)(out[31] | ((x[0] & 1) << 7));
 }
 
+ONION_HD static void ge_compress(const ge *p, u8 out[32]) {
+  fe zinv;
+  fe_invert(zinv, p->Z);
+  ge_compress_inv(p, zinv, out);
+}
+
+/* ------------------------------------------------------------------ */
+/* warp-cooperative batch inversion (CUDA only)                        */
+/* ------------------------------------------------------------------ */
+
+#ifdef __CUDACC__
+
+__device__ static inline void fe_shfl_sync(fe out, const fe in, int srcLane) {
+  for (int i = 0; i < 8; i++) out[i] = __shfl_sync(0xffffffffu, in[i], srcLane);
+}
+
+__device__ static inline void fe_shfl_up_sync(fe out, const fe in, unsigned delta) {
+  for (int i = 0; i < 8; i++) out[i] = __shfl_up_sync(0xffffffffu, in[i], delta);
+}
+
+__device__ static inline void fe_shfl_down_sync(fe out, const fe in, unsigned delta) {
+  for (int i = 0; i < 8; i++) out[i] = __shfl_down_sync(0xffffffffu, in[i], delta);
+}
+
+/*
+ * Batch inversion across the 32 lanes of a warp (Montgomery's trick).
+ *
+ * The 254-squaring inversion chain runs once per warp on a broadcast value,
+ * so 32 candidates pay for a single inversion instead of 32. All 32 lanes must
+ * reach this call (no divergence around it). A zero z would only occur if a
+ * candidate scalar were a multiple of the group order (~2^-252), and such a
+ * result is discarded by the host-side verification anyway.
+ */
+__device__ static void fe_invert_warp(fe out, const fe z) {
+  const unsigned lane = threadIdx.x & 31u;
+
+  /* inclusive prefix products: P_i = z_0 * ... * z_i */
+  fe P;
+  for (int i = 0; i < 8; i++) P[i] = z[i];
+  for (unsigned off = 1; off < 32; off <<= 1) {
+    fe q;
+    fe_shfl_up_sync(q, P, off);
+    if (lane >= off) fe_mul(P, P, q);
+  }
+
+  /* inclusive suffix products: S_i = z_i * ... * z_31 */
+  fe S;
+  for (int i = 0; i < 8; i++) S[i] = z[i];
+  for (unsigned off = 1; off < 32; off <<= 1) {
+    fe q;
+    fe_shfl_down_sync(q, S, off);
+    if (lane + off < 32) fe_mul(S, S, q);
+  }
+
+  /* one inversion for the whole warp on the total product */
+  fe total, u;
+  fe_shfl_sync(total, P, 31);
+  fe_invert(u, total);
+
+  /* exclusive prefix E_i = prod_{j<i} z_j, exclusive suffix N_i = prod_{j>i} z_j */
+  fe E, N;
+  fe_shfl_up_sync(E, P, 1);
+  if (lane == 0) fe_one(E);
+  fe_shfl_down_sync(N, S, 1);
+  if (lane == 31) fe_one(N);
+
+  /* out_i = u * E_i * N_i = 1 / z_i */
+  fe_mul(out, u, E);
+  fe_mul(out, out, N);
+}
+
+#endif /* __CUDACC__ */
+
 /* ------------------------------------------------------------------ */
 /* address derivation and pattern matching                             */
 /* ------------------------------------------------------------------ */
 
-/* 35 address bytes = PUBKEY(32) | SHA3-256 checksum(2) | 0x03 */
-ONION_HD static void onion_address_from_seed(const onion_tables *T,
-                                             const comb_table *table,
-                                             const u8 seed[32], u8 out[35]) {
+/* A = clamp(SHA-512(seed)) * B, left in projective coordinates */
+ONION_HD static void onion_point_from_seed(const onion_tables *T,
+                                           const comb_table *table,
+                                           const u8 seed[32], ge *r) {
   u8 h[64];
   onion_sha512(T, seed, 32, h);
 
@@ -624,15 +813,17 @@ ONION_HD static void onion_address_from_seed(const onion_tables *T,
   h[31] &= 127;
   h[31] |= 64;
 
-  ge r;
-  comb_mult(&r, h, table);
-  ge_compress(&r, out);
+  comb_mult(r, h, table);
+}
 
+/* out[32..35] = SHA3-256(".onion checksum" | pub | 0x03)[:2] | 0x03 */
+ONION_HD static void onion_append_checksum(const onion_tables *T, const u8 pub[32],
+                                           u8 out[35]) {
   u8 input[48];
   const u8 prefix[15] = {'.', 'o', 'n', 'i', 'o', 'n', ' ', 'c',
                          'h', 'e', 'c', 'k', 's', 'u', 'm'};
   onion_memcpy(input, prefix, 15);
-  onion_memcpy(input + 15, out, 32);
+  onion_memcpy(input + 15, pub, 32);
   input[47] = 0x03;
 
   u8 digest[32];
@@ -640,6 +831,16 @@ ONION_HD static void onion_address_from_seed(const onion_tables *T,
   out[32] = digest[0];
   out[33] = digest[1];
   out[34] = 0x03;
+}
+
+/* 35 address bytes = PUBKEY(32) | SHA3-256 checksum(2) | 0x03 */
+ONION_HD static void onion_address_from_seed(const onion_tables *T,
+                                             const comb_table *table,
+                                             const u8 seed[32], u8 out[35]) {
+  ge r;
+  onion_point_from_seed(T, table, seed, &r);
+  ge_compress(&r, out);
+  onion_append_checksum(T, out, out);
 }
 
 /* pattern compiled like the Node side: masks over the 35 address bytes */
@@ -650,16 +851,19 @@ typedef struct {
   u8 cbyte[ONION_PATTERN_MAXCMP];
   u8 cmask[ONION_PATTERN_MAXCMP];
   u8 cval[ONION_PATTERN_MAXCMP];
-  u32 mode;      /* 1 = prefix, 2 = suffix */
+  u32 mode;        /* 1 = prefix, 2 = suffix */
   u32 nchars;
   u8 vals[56];
+  u32 needs_tail;  /* 1 when the pattern touches the checksum/version bytes */
 } onion_pattern;
 
+/* branch-free: no early exit, so a warp never diverges inside the loop */
 ONION_HD static int onion_pattern_match(const onion_pattern *p, const u8 addr[35]) {
+  u32 ok = 1;
   for (u32 i = 0; i < p->ncmp; i++) {
-    if ((addr[p->cbyte[i]] & p->cmask[i]) != p->cval[i]) return 0;
+    ok &= (u32)((addr[p->cbyte[i]] & p->cmask[i]) == p->cval[i]);
   }
-  return 1;
+  return (int)ok;
 }
 
 /* value of the 5-bit base32 group starting at bit (MSB-first) */
@@ -670,19 +874,16 @@ ONION_HD static u32 onion_value_at(const u8 *bytes, u32 bit) {
 }
 
 /* matching characters from the pattern side; needs a 36-byte buffer with a
- * zero spare byte at index 35 */
+ * zero spare byte at index 35. Branch-free with a warp-uniform trip count. */
 ONION_HD static u32 onion_pattern_score(const onion_pattern *p, const u8 *addr36) {
   u32 best = 0;
-  if (p->mode == 1) {
-    while (best < p->nchars && onion_value_at(addr36, best * 5) == p->vals[best]) {
-      best++;
-    }
-  } else {
-    while (best < p->nchars &&
-           onion_value_at(addr36, 280 - 5 * (best + 1)) ==
-               p->vals[p->nchars - 1 - best]) {
-      best++;
-    }
+  u32 alive = 1;
+  for (u32 i = 0; i < p->nchars; i++) {
+    const u32 bit = (p->mode == 1) ? i * 5 : 280 - 5 * (i + 1);
+    const u32 want = (p->mode == 1) ? p->vals[i] : p->vals[p->nchars - 1 - i];
+    const u32 ok = (u32)(onion_value_at(addr36, bit) == want) & alive;
+    best += ok;
+    alive &= ok;
   }
   return best;
 }

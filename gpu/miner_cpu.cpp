@@ -121,6 +121,7 @@ static bool compile_pattern(const std::string &raw, onion_pattern *out) {
 
   out->ncmp = 0;
   out->mode = (u32)mode;
+  out->needs_tail = 0;
   out->nchars = (u32)body.size();
   for (u32 i = 0; i < out->nchars; i++) {
     out->vals[i] = (u8)(strchr(ALPHABET, body[i]) - ALPHABET);
@@ -145,6 +146,7 @@ static bool compile_pattern(const std::string &raw, onion_pattern *out) {
       out->cbyte[out->ncmp] = (u8)byte;
       out->cmask[out->ncmp] = masks[byte];
       out->cval[out->ncmp] = values[byte];
+      if (byte >= 32) out->needs_tail = 1;
       out->ncmp++;
     }
   }
@@ -247,17 +249,31 @@ static int cmd_mine(const std::string &pattern_raw) {
   u32 best = 0;
   double last_report = now_seconds();
 
+  u8 addr[36];
+  addr[35] = 0; /* spare byte for the score's two-byte window */
+  if (!pattern.needs_tail) onion_memset(addr + 32, 0, 3);
+
   for (;;) {
     for (u32 i = 0; i < 256; i++) {
       u8 seed[32];
-      u8 addr[36];
+      ge point;
       splitmix64_fill(&state, seed);
-      onion_address_from_seed(&g_tables, &g_comb, seed, addr);
-      addr[35] = 0;
+      onion_point_from_seed(&g_tables, &g_comb, seed, &point);
+
+      if (pattern.needs_tail) {
+        u8 pub[32];
+        ge_compress(&point, pub);
+        onion_memcpy(addr, pub, 32);
+        onion_append_checksum(&g_tables, pub, addr);
+      } else {
+        /* prefixes up to 51 chars live inside the public key: no SHA3 at all */
+        ge_compress(&point, addr);
+      }
       attempts++;
 
       if (onion_pattern_match(&pattern, addr)) {
         char address[57];
+        if (!pattern.needs_tail) onion_append_checksum(&g_tables, addr, addr);
         onion_base32_56(addr, address);
         printf("{\"type\":\"match\",\"address\":\"%s\",\"seed\":\"%s\",\"attempts\":%llu,"
                "\"device\":0}\n",

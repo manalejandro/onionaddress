@@ -87,22 +87,49 @@ __global__ void mine_kernel(u64 iterations, u64 salt, u64 *prng_states,
   u32 best = 0;
   (void)salt;
 
+  /* addr[35] is the spare byte the score's two-byte window reads; bytes
+   * 32..34 stay zero while the pattern never touches the tail. */
+  u8 addr[36];
+  addr[32] = 0;
+  addr[33] = 0;
+  addr[34] = 0;
+  addr[35] = 0;
+
   for (u64 it = 0; it < iterations; it++) {
     u8 seed[32];
-    u8 addr[36];
     splitmix64_fill(&state, seed);
-    onion_address_from_seed(&T, table, seed, addr);
-    addr[35] = 0;
+
+    ge point;
+    onion_point_from_seed(&T, table, seed, &point);
+
+    fe zinv;
+    fe_invert_warp(zinv, point.Z);
+
+    if (pattern.needs_tail) {
+      u8 pub[32];
+      ge_compress_inv(&point, zinv, pub);
+      onion_memcpy(addr, pub, 32);
+      onion_append_checksum(&T, pub, addr);
+    } else {
+      /* prefixes up to 51 characters: no SHA3-256 at all */
+      ge_compress_inv(&point, zinv, addr);
+    }
     attempts++;
 
     if (onion_pattern_match(&pattern, addr)) {
       const u32 pos = atomicAdd(&counters->count, 1u);
       if (pos < MAX_MATCHES) {
+        if (!pattern.needs_tail) onion_append_checksum(&T, addr, addr);
         for (u32 i = 0; i < 32; i++) slots[pos].seed[i] = seed[i];
         for (u32 i = 0; i < 35; i++) slots[pos].addr[i] = addr[i];
         slots[pos].attempts = attempts;
       } else {
         atomicAdd(&counters->overflow, 1u);
+      }
+      if (!pattern.needs_tail) {
+        addr[32] = 0;
+        addr[33] = 0;
+        addr[34] = 0;
       }
     } else {
       const u32 score = onion_pattern_score(&pattern, addr);
@@ -226,6 +253,7 @@ static bool compile_pattern(const std::string &raw, onion_pattern *out) {
 
   out->ncmp = 0;
   out->mode = (u32)mode;
+  out->needs_tail = 0;
   out->nchars = (u32)body.size();
   for (u32 i = 0; i < out->nchars; i++) {
     out->vals[i] = (u8)(strchr(ALPHABET, body[i]) - ALPHABET);
@@ -249,6 +277,7 @@ static bool compile_pattern(const std::string &raw, onion_pattern *out) {
       out->cbyte[out->ncmp] = (u8)byte;
       out->cmask[out->ncmp] = masks[byte];
       out->cval[out->ncmp] = values[byte];
+      if (byte >= 32) out->needs_tail = 1;
       out->ncmp++;
     }
   }
