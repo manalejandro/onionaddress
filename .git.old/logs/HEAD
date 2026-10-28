@@ -1,4 +1,0 @@
-0000000000000000000000000000000000000000 f2b0e355282076463f6c949199bad4ddd87016e7 ale <ale@manalejandro.com> 1792016468 +0200	commit (initial): Initial implementation of onionaddress
-f2b0e355282076463f6c949199bad4ddd87016e7 eb5bfbe68b1fc3538b145c89baf198d4aa48b533 ale <ale@manalejandro.com> 1792016767 +0200	commit: Switch generator from v2 to v3 onion addresses
-eb5bfbe68b1fc3538b145c89baf198d4aa48b533 8f65611691d41735f27f7ab6143a6e0f73fa8379 ale <ale@manalejandro.com> 1792017478 +0200	commit: Speed up mining ~1.8x and fix the checksum fast path
-8f65611691d41735f27f7ab6143a6e0f73fa8379 03a5149ea2b592b94a4112c923074767cd9799ac ale <ale@manalejandro.com> 1792018614 +0200	commit: Add CUDA GPU mining backend
