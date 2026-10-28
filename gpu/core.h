@@ -462,8 +462,21 @@ typedef struct {
   fe X, Y, Z, T;
 } ge;
 
-#define COMB_WINDOWS 32
-#define COMB_ENTRIES 256
+/*
+ * Comb geometry. ONION_COMB_BITS is the window width in bits: the scalar's 256
+ * bits are split into COMB_WINDOWS windows of COMB_BITS bits, each selecting
+ * one of COMB_ENTRIES precomputed points. Wider windows mean fewer mixed
+ * additions (the dominant cost) at the price of a bigger table:
+ *
+ *    8 bits -> 32 windows x 256 entries   =   1 MB, 31 madds
+ *   16 bits -> 16 windows x 65536 entries = 128 MB, 15 madds
+ */
+#ifndef ONION_COMB_BITS
+#define ONION_COMB_BITS 8
+#endif
+
+#define COMB_WINDOWS (256 / ONION_COMB_BITS)
+#define COMB_ENTRIES (1u << ONION_COMB_BITS)
 
 /*
  * Fixed-base comb table: window w holds the points n * 16^w * B (n = 0..15) in
@@ -480,6 +493,7 @@ typedef struct {
   u32 Y[COMB_WINDOWS][8][COMB_ENTRIES];
   u32 T[COMB_WINDOWS][8][COMB_ENTRIES];
   u32 T2[COMB_WINDOWS][8][COMB_ENTRIES];
+  u32 d2[8]; /* 2d, needed to combine the independent comb chains */
 } comb_table;
 
 /*
@@ -631,7 +645,7 @@ ONION_HD static void onion_comb_init_window(comb_table *table, u32 w,
     table->T2[w][i][0] = 0;
   }
 
-  /* G_w = 256^w * B (eight doublings per window) */
+  /* G_w = (2^COMB_BITS)^w * B: COMB_BITS doublings per window */
   ge G;
   for (u32 i = 0; i < 8; i++) {
     G.X[i] = B->X[i];
@@ -640,7 +654,7 @@ ONION_HD static void onion_comb_init_window(comb_table *table, u32 w,
     G.T[i] = B->T[i];
   }
   for (u32 i = 0; i < w; i++) {
-    for (u32 k = 0; k < 8; k++) ge_add(&G, &G, &G, d2);
+    for (u32 k = 0; k < ONION_COMB_BITS; k++) ge_add(&G, &G, &G, d2);
   }
 
   /* affine G, so the chain below can use mixed additions */
@@ -691,24 +705,61 @@ ONION_HD static int onion_comb_init(comb_table *table) {
   fe d2;
   ge B;
   if (onion_curve_init(d2, &B) != 0) return -1;
+  for (u32 i = 0; i < 8; i++) table->d2[i] = d2[i];
   for (u32 w = 0; w < COMB_WINDOWS; w++) onion_comb_init_window(table, w, d2, &B);
   return 0;
 }
 
-/* r = scalar * B using the comb table; scalar is 32 little-endian bytes.
+/*
+ * r = scalar * B using the comb table; scalar is 32 little-endian bytes.
  * One 8-bit window per byte: 31 mixed additions instead of 63 with 4-bit
- * windows, which is the single biggest saving in the whole pipeline. */
-ONION_HD static void comb_mult(ge *r, const u8 scalar[32], const comb_table *table) {
-  const u32 d0 = scalar[0];
-  for (u32 i = 0; i < 8; i++) {
-    r->X[i] = table->X[0][i][d0];
-    r->Y[i] = table->Y[0][i][d0];
-    r->T[i] = table->T[0][i][d0];
-  }
-  fe_one(r->Z);
+ * windows.
+ *
+ * The additions form a serial dependency chain. Splitting the windows into
+ * ONION_COMB_CHAINS independent partial sums would raise ILP, but each extra
+ * chain needs another live point accumulator (~32 registers) and the kernel
+ * already runs at ~116 registers/thread: measured on a GTX 1650 SUPER, 2 and 4
+ * chains are 35% and 39% SLOWER than 1 because of spilling. So the default is
+ * a single chain; the knob stays available for GPUs with more registers.
+ */
+#ifndef ONION_COMB_CHAINS
+#define ONION_COMB_CHAINS 1
+#endif
 
-  for (u32 w = 1; w < COMB_WINDOWS; w++) {
-    ge_madd_tab(r, r, table, w, scalar[w]);
+/* extract the COMB_BITS-bit digit of window w from the little-endian scalar */
+ONION_HD static u32 comb_digit(const u8 scalar[32], u32 w) {
+  const u32 bit = w * ONION_COMB_BITS;
+  u32 digit = 0;
+  for (u32 k = 0; k < ONION_COMB_BITS; k++) {
+    digit |= (u32)((scalar[(bit + k) >> 3] >> ((bit + k) & 7)) & 1) << k;
+  }
+  return digit;
+}
+
+ONION_HD static void comb_mult(ge *r, const u8 scalar[32], const comb_table *table) {
+  ge acc[ONION_COMB_CHAINS];
+
+  for (u32 c = 0; c < ONION_COMB_CHAINS; c++) {
+    const u32 digit = comb_digit(scalar, c);
+    for (u32 i = 0; i < 8; i++) {
+      acc[c].X[i] = table->X[c][i][digit];
+      acc[c].Y[i] = table->Y[c][i][digit];
+      acc[c].T[i] = table->T[c][i][digit];
+    }
+    fe_one(acc[c].Z);
+  }
+
+  for (u32 w = ONION_COMB_CHAINS; w < COMB_WINDOWS; w++) {
+    ge_madd_tab(&acc[w % ONION_COMB_CHAINS], &acc[w % ONION_COMB_CHAINS], table, w,
+                comb_digit(scalar, w));
+  }
+
+  fe d2;
+  for (u32 i = 0; i < 8; i++) d2[i] = table->d2[i];
+
+  *r = acc[0];
+  for (u32 c = 1; c < ONION_COMB_CHAINS; c++) {
+    ge_add(r, r, &acc[c], d2);
   }
 }
 

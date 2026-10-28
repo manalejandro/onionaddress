@@ -71,6 +71,9 @@ __global__ void comb_init_kernel(comb_table *table) {
   fe d2;
   ge B;
   if (onion_curve_init(d2, &B) != 0) return;
+  if (w == 0) {
+    for (u32 i = 0; i < 8; i++) table->d2[i] = d2[i];
+  }
   onion_comb_init_window(table, w, d2, &B);
 }
 

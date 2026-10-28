@@ -38,8 +38,8 @@ saved as a ready-to-use hidden service directory under `output/`.
   reuses scratch buffers and extracts raw keys through the cheapest Node API
   (~160K candidates/s on a 6-core desktop).
 - **Optional CUDA backend** — a self-contained CUDA miner (`gpu/`, built with
-  `make -C gpu cuda`) mines on NVIDIA GPUs at ~5M candidates/s on a
-  GTX 1650 SUPER (~30× the Node CPU path), sharing the same verified crypto
+  `make -C gpu cuda`) mines on NVIDIA GPUs at ~8.3M candidates/s on a
+  GTX 1650 SUPER (~50× the Node CPU path), sharing the same verified crypto
   core. Every GPU result is re-derived and re-checked with Node/OpenSSL
   before anything is written to disk.
 - **Fast matching** — patterns are compiled to bit masks over the 35 address
@@ -223,9 +223,9 @@ machine (Intel i5-10400F, 6 cores / 12 threads, Node 22, 11 workers):
 | 8            |      4,294,967,296 |           7.4 h             |   5.1 h     |
 | 9            |    137,438,953,472 |           9.8 days          |   6.8 days  |
 
-With the CUDA miner (~5.0M keys/s on the test GTX 1650 SUPER — see the GPU
-section below) divide those times by ~30: a 5-character prefix comes out in
-~7 seconds, 6 characters in ~3.6 minutes, 7 characters in ~1.9 hours.
+With the CUDA miner (~8.3M keys/s on the test GTX 1650 SUPER — see the GPU
+section below) divide those times by ~50: a 5-character prefix comes out in
+~4 seconds, 6 characters in ~2.2 minutes, 7 characters in ~1.2 hours.
 
 Use `--estimate` for exact numbers on any pattern:
 
@@ -353,30 +353,30 @@ onionaddress benchmark --gpu         # measure GPU throughput
 ```
 
 ```console
-$ onionaddress --gpu ^cafe
+$ onionaddress --gpu ^onion
 
 onionaddress 1.0.0 · Tor v3 onion service vanity address generator
 
-  pattern   ^cafe (prefix, 4 chars)
-  odds      1 in 1,048,576 addresses · expected 1,048,576 attempts
+  pattern   ^onion (prefix, 5 chars)
+  odds      1 in 33,554,432 addresses · expected 33,554,432 attempts
   sources   cuda · all devices
 
-  ✔ found cafedirep6tpvgj3ukbvs563hv766657kzkr5jpynrc6ahshtbix2mid.onion (1/1)
-    saved to /home/you/onionaddress/output/cafedirep6tpvgj3ukbvs563hv766657kzkr5jpynrc6ahshtbix2mid.onion
+  ✔ found onion5szwnndtlgox2pwkwev6l64d5wsh6rlnou6hslpxiesnlzqenad.onion (1/1)
+    saved to /home/you/onionaddress/output/onion5szwnndtlgox2pwkwev6l64d5wsh6rlnou6hslpxiesnlzqenad.onion
 
-  done 1 match in 504ms (819,200 attempts · 1.63M keys/s)
+  done 1 match in 3.0s (24,002,560 attempts · 8.03M keys/s)
 ```
 
 ### Measured throughput
 
 | Machine                    | Rate         |
 | -------------------------- | ------------ |
-| GTX 1650 SUPER (1 device)  | ~5.0M keys/s |
+| GTX 1650 SUPER (1 device)  | ~8.3M keys/s |
 | i5-10400F, 11 Node workers | ~162K keys/s |
 
-That is ~31× over the pure-Node path on this machine, which moves feasible
+That is ~50× over the pure-Node path on this machine, which moves feasible
 targets by roughly 2.5 characters: 6-character prefixes go from hours to
-minutes, 7-character prefixes from days to hours.
+minutes, 7-character prefixes from days to about an hour.
 
 ### How it works
 
@@ -398,11 +398,43 @@ minutes, 7-character prefixes from days to hours.
   stream whose salt is read from `/dev/urandom` on the host and never stored;
   the private keys cannot be reconstructed from the public search parameters.
 
-### Tuning ideas
+### What was measured (and what did not work)
 
-Larger fixed-base windows, batch inversion across a warp, or a second kernel
-for checksum work would speed the kernel up further; the code is organized to
-make those experiments easy (`onion_comb_init_window`, `comb_mult`).
+Every change below was profiled on the device rather than guessed. Per-stage
+costs measured with a dedicated microbenchmark (cycles per operation per lane):
+`fe_add` ~395, `fe_mul` ~3200 (~400 SASS instructions), `ge_madd` ~26K,
+`fe_invert` ~738K, `sha512` ~22K, `sha3` ~34K.
+
+Kept, because they measured faster:
+
+- **8-bit comb windows** (31 mixed additions instead of 63 with 4-bit): the
+  single biggest win.
+- **Branch-free field arithmetic and pattern matching** — data-dependent
+  branches make all 32 lanes of a warp execute both paths serially.
+- **Warp batch inversion** (Montgomery + `__shfl`): 32 candidates share one
+  inversion chain, so `fe_invert` effectively disappears from the hot path.
+- **Tail-free prefix mining**: prefixes up to 51 characters never compute the
+  SHA3-256 checksum.
+- **Structure-of-arrays comb table**: a warp reads 32 adjacent `u32` per
+  coordinate instead of 32 scattered cache lines.
+
+Measured and rejected:
+
+| Experiment | Result | Verdict |
+| --- | --- | --- |
+| 4-bit windows (128 KB table, L1-resident, 63 madds) | 6.3M keys/s | worse than 8-bit |
+| **8-bit windows (1 MB table, L2-resident, 31 madds)** | **8.3M keys/s** | **best** |
+| 16-bit windows (128 MB table, DRAM-resident, 15 madds) | 3.3M keys/s | 2.6× worse: every lookup misses L2 and the madd chain is serial |
+| Split the comb into 2 / 4 independent chains (more ILP) | 5.0M / 4.8M keys/s | worse: each extra chain needs a live point accumulator (~32 registers) and the kernel already uses ~116, so it spills |
+| Radix 2^26 (10-limb) field arithmetic, ref10-style | 3117 vs 3222 cycles per `fe_mul` | only 3% faster — not worth the rewrite risk |
+| `-maxrregcount` 96 / 128 / 168 | 7.1M / 7.2M / 8.2M keys/s | the compiler's default (~116) wins |
+
+The remaining ceiling is memory latency on the comb table plus the serial
+dependency chain of mixed additions; that is why the L2-resident 1 MB table
+beats both a smaller table (more arithmetic) and a much larger one (DRAM
+latency). `ONION_COMB_BITS` and `ONION_COMB_CHAINS` are compile-time knobs
+(`make -C gpu cuda EXTRA_FLAGS=-DONION_COMB_BITS=4`) so other GPUs can be
+tuned without touching the code.
 
 ## Output
 
