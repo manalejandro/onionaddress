@@ -9,9 +9,11 @@
  *
  * Source interface: see src/cpu.js.
  */
-import { spawn } from 'node:child_process';
-import { constants as fsConstants, accessSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { constants as fsConstants, accessSync, existsSync } from 'node:fs';
 import crypto from 'node:crypto';
+import path from 'node:path';
+import process from 'node:process';
 import { createInterface } from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import {
@@ -29,21 +31,21 @@ const CANDIDATE_URLS = [
   new URL('../bin/onionaddress-cpu', import.meta.url),
 ];
 
+function isExecutable(candidate) {
+  try {
+    accessSync(candidate, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Locate a miner binary. An explicit path is authoritative (no fallback);
  * otherwise ONIONADDRESS_MINER wins, then the built binaries under bin/
  * (CUDA first, CPU reference second).
  */
 export function findMiner({ explicit } = {}) {
-  const isExecutable = (candidate) => {
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return true;
-    } catch {
-      return false;
-    }
-  };
-
   if (explicit) {
     return isExecutable(explicit) ? explicit : null;
   }
@@ -54,6 +56,59 @@ export function findMiner({ explicit } = {}) {
     if (isExecutable(candidate)) return candidate;
   }
   return null;
+}
+
+/** Which flavour a miner binary is, from its file name. */
+export function minerKind(minerPath) {
+  const base = path.basename(minerPath);
+  if (base.includes('cuda')) return 'cuda';
+  if (base.includes('cpu')) return 'cpu';
+  return 'unknown';
+}
+
+let buildAttempted = false;
+
+/**
+ * Build the native miners by running scripts/build-miners.js (the same script
+ * the postinstall hook uses). Best effort: returns false when the toolchain is
+ * missing, the sources are not shipped, or the package directory is read-only.
+ */
+function buildMinersNow(onLog) {
+  if (buildAttempted) return false;
+  buildAttempted = true;
+  if (process.env.ONION_NO_AUTOBUILD === '1') return false;
+
+  const script = fileURLToPath(new URL('../scripts/build-miners.js', import.meta.url));
+  if (!existsSync(script)) return false;
+
+  onLog('no prebuilt miner found; building it now (one time, needs g++ and optionally nvcc)');
+  const result = spawnSync(process.execPath, [script], { stdio: 'inherit' });
+  return !result.error && result.status === 0;
+}
+
+/**
+ * Locate a miner binary, building it on demand when needed.
+ *
+ * npm >= 11 blocks dependency install scripts unless they are explicitly
+ * allowed, so the postinstall build cannot be relied upon: this falls back to
+ * compiling on first use, which keeps `npx github:manalejandro/onionaddress
+ * --gpu ...` working on a fresh machine. An explicit path is authoritative and
+ * never triggers a build.
+ */
+export function ensureMiner({ explicit = null, wantCuda = true, onLog = () => {} } = {}) {
+  if (explicit) {
+    return isExecutable(explicit) ? explicit : null;
+  }
+
+  const existing = findMiner();
+  if (existing && (!wantCuda || minerKind(existing) === 'cuda')) return existing;
+
+  if (buildMinersNow(onLog)) {
+    const built = findMiner();
+    if (built && (!wantCuda || minerKind(built) === 'cuda')) return built;
+    if (built) return built;
+  }
+  return existing;
 }
 
 /**

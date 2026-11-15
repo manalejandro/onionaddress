@@ -78,6 +78,32 @@ npm link
 npx github:manalejandro/onionaddress --help
 ```
 
+The CPU search needs nothing else: it is pure Node.
+
+### Native miners (built automatically)
+
+GPU mining needs a small native binary. It is built **for you**, in this order:
+
+1. `postinstall` runs `scripts/build-miners.js` when npm allows install scripts.
+2. If npm blocked it — npm ≥ 11 blocks dependency install scripts unless they
+   are listed in `allowScripts`, so this is the common case — the CLI builds the
+   miners **on first use** and caches them in `bin/`. You will see one line:
+   `no prebuilt miner found; building it now (one time, needs g++ and optionally nvcc)`.
+3. Or build them explicitly at any time:
+
+```bash
+npm run build          # both miners, best effort
+npm run build:cuda     # CUDA miner only (needs nvcc)
+make -C gpu cuda CUDA_ARCH=sm_75
+```
+
+Building is always best effort and never fails the install: without a C++
+toolchain you keep the full CPU search, and `--gpu` prints what is missing.
+Useful environment variables: `ONION_NO_AUTOBUILD=1` (disable the lazy build),
+`ONION_CUDA_ARCH` (force the nvcc architecture; defaults to `native` when a GPU
+is visible, otherwise PTX for `compute_75` so the driver can JIT it),
+`CXX` / `NVCC` (toolchain overrides).
+
 ## Usage
 
 ```
@@ -161,7 +187,7 @@ A successful run looks like this:
 ```console
 $ onionaddress -w 11 ^dead
 
-onionaddress 1.0.0 · Tor v3 onion service vanity address generator
+onionaddress 1.0.1 · Tor v3 onion service vanity address generator
 
   pattern   ^dead (prefix, 4 chars)
   odds      1 in 1,048,576 addresses · expected 1,048,576 attempts
@@ -312,7 +338,7 @@ minutes away on a desktop CPU.
 
 ```console
 $ onionaddress benchmark --seconds 5
-onionaddress 1.0.0 · keygen benchmark
+onionaddress 1.0.1 · keygen benchmark
 
   measuring 11 workers for 5s ...
 
@@ -330,18 +356,22 @@ onionaddress 1.0.0 · keygen benchmark
 ## GPU mining (CUDA)
 
 `onionaddress` ships a self-contained CUDA miner that reuses the same
-verifiable crypto core as the CPU path and typically runs ~30× faster.
+verifiable crypto core as the CPU path and typically runs ~50× faster.
 
 ### Build
 
+The miner is built for you on install, or lazily on first use — see
+[Native miners](#native-miners-built-automatically). To build it by hand:
+
 ```bash
-make -C gpu cuda     # NVIDIA GPU + CUDA toolkit -> bin/onionaddress-cuda
-make -C gpu cpu      # g++ reference miner (used by the test suite) -> bin/onionaddress-cpu
+npm run build:cuda   # = make -C gpu cuda  -> bin/onionaddress-cuda
+npm run build:cpu    # = make -C gpu cpu   -> bin/onionaddress-cpu (reference, used by tests)
 ```
 
-The Makefile finds `nvcc` in `PATH` or `/usr/local/cuda/bin` and targets your
-GPU by default (`-arch=native`); use `make -C gpu cuda CUDA_ARCH=sm_75` for
-cross-compiling.
+Both the Makefile and `scripts/build-miners.js` find `nvcc` in `PATH` or
+`/usr/local/cuda/bin` and target your GPU by default (`-arch=native`); pass
+`CUDA_ARCH=sm_75` (Makefile) or `ONION_CUDA_ARCH=sm_75` (script) to
+cross-compile.
 
 ### Usage
 
@@ -355,7 +385,7 @@ onionaddress benchmark --gpu         # measure GPU throughput
 ```console
 $ onionaddress --gpu ^onion
 
-onionaddress 1.0.0 · Tor v3 onion service vanity address generator
+onionaddress 1.0.1 · Tor v3 onion service vanity address generator
 
   pattern   ^onion (prefix, 5 chars)
   odds      1 in 33,554,432 addresses · expected 33,554,432 attempts

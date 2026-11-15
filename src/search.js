@@ -19,7 +19,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createCpuSource } from './cpu.js';
 import { successProbability } from './estimator.js';
-import { createGpuSource, findMiner, listMinerDevices, verifyMinerMatch } from './gpu.js';
+import { createGpuSource, ensureMiner, listMinerDevices, verifyMinerMatch } from './gpu.js';
 import { ensureOutputDir, reviseMetadata, saveResult } from './output.js';
 import { parsePattern } from './pattern.js';
 import { VERSION } from './version.js';
@@ -68,14 +68,26 @@ export async function search(options = {}) {
   let resolvedMiner = null;
   let gpuDevices = [];
   if (wantsGpu) {
-    resolvedMiner = findMiner({ explicit: minerPath });
+    resolvedMiner = ensureMiner({
+      explicit: minerPath,
+      wantCuda: true,
+      onLog: (message) => onEvent({ type: 'info', message }),
+    });
     if (!resolvedMiner) {
       throw new Error(
-        'no miner binary found; build one with "make -C gpu cuda" (or "make -C gpu cpu") ' +
-          'or set ONIONADDRESS_MINER',
+        'no miner binary found and it could not be built; install a C++ toolchain (and the ' +
+          'CUDA toolkit for GPU mining), or run "npm run build:cuda" / set ONIONADDRESS_MINER',
       );
     }
     const available = await listMinerDevices(resolvedMiner);
+    if (!minerPath && !available.some((device) => device.backend === 'cuda')) {
+      onEvent({
+        type: 'warning',
+        message:
+          `the miner at ${resolvedMiner} reports no CUDA device, so this run uses the slow CPU ` +
+          'reference miner; build the CUDA miner with "npm run build:cuda" (needs the CUDA toolkit)',
+      });
+    }
     const wanted =
       devices === true ? available.map((device) => device.index) : Array.isArray(devices) ? devices : [devices];
     for (const index of wanted) {

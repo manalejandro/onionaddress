@@ -11,7 +11,7 @@ import {
   successProbability,
 } from './estimator.js';
 import { PatternError, parsePattern } from './pattern.js';
-import { benchmarkMiner, findMiner, listMinerDevices } from './gpu.js';
+import { benchmarkMiner, ensureMiner, listMinerDevices } from './gpu.js';
 import { defaultWorkerCount, search } from './search.js';
 import { VERSION } from './version.js';
 
@@ -360,7 +360,11 @@ async function runBenchmarkCommand(options) {
 }
 
 async function runGpuBenchmarkCommand(options) {
-  const minerPath = findMiner({ explicit: options.miner });
+  const minerPath = ensureMiner({
+    explicit: options.miner,
+    wantCuda: true,
+    onLog: (message) => process.stderr.write(`  ${style.dim(message)}\n`),
+  });
   if (!minerPath) {
     printMissingMinerError();
     return 1;
@@ -413,15 +417,19 @@ function printRoughExpectations(rate) {
 
 function printMissingMinerError() {
   process.stderr.write(
-    `${style.red('error:')} no miner binary found\n` +
-      `  build one with ${style.bold('make -C gpu cuda')} (NVIDIA GPU + CUDA toolkit)\n` +
-      `  or ${style.bold('make -C gpu cpu')} for the reference miner, then run again\n` +
-      `  (or point --miner / $ONIONADDRESS_MINER at a miner binary)\n`,
+    `${style.red('error:')} no miner binary found, and it could not be built automatically\n` +
+      `  install a C++ toolchain (g++) and, for GPU mining, the CUDA toolkit (nvcc), then run\n` +
+      `  ${style.bold('npm run build')}   (or ${style.bold('make -C gpu cuda')})\n` +
+      `  or point ${style.bold('--miner')} / $ONIONADDRESS_MINER at an existing miner binary\n`,
   );
 }
 
 async function runDevicesCommand(options) {
-  const minerPath = findMiner({ explicit: options.miner });
+  const minerPath = ensureMiner({
+    explicit: options.miner,
+    wantCuda: true,
+    onLog: (message) => process.stderr.write(`  ${style.dim(message)}\n`),
+  });
   if (!minerPath) {
     printMissingMinerError();
     return 1;
@@ -538,6 +546,8 @@ class ProgressRenderer {
   handle(event) {
     if (event.type === 'progress') this.renderProgress(event);
     else if (event.type === 'found') this.renderFound(event);
+    else if (event.type === 'warning') this.renderWarning(event);
+    else if (event.type === 'info') this.renderInfo(event);
     else if (event.type === 'error') this.renderError(event);
   }
 
@@ -573,6 +583,16 @@ class ProgressRenderer {
   renderError(event) {
     this.clearLine();
     process.stderr.write(`  ${style.red('error:')} ${event.error?.message ?? event.error}\n`);
+  }
+
+  renderWarning(event) {
+    this.clearLine();
+    process.stderr.write(`  ${style.yellow('warning')} ${event.message}\n`);
+  }
+
+  renderInfo(event) {
+    this.clearLine();
+    process.stderr.write(`  ${style.dim(event.message)}\n`);
   }
 
   finish() {

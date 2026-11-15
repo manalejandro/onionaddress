@@ -1,6 +1,6 @@
 {
   "name": "onionaddress",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Vanity address generator for Tor v3 onion services with a probability-aware, multi-core search engine.",
   "keywords": [
     "tor",
@@ -33,7 +33,8 @@
   },
   "files": [
     "src",
-    "gpu"
+    "gpu",
+    "scripts"
   ],
   "engines": {
     "node": ">=20"
@@ -42,6 +43,8 @@
     "start": "node src/cli.js",
     "test": "node --test",
     "benchmark": "node src/cli.js benchmark",
+    "postinstall": "node scripts/build-miners.js",
+    "build": "node scripts/build-miners.js",
     "build:cpu": "make -C gpu cpu",
     "build:cuda": "make -C gpu cuda"
   }

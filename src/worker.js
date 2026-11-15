@@ -22,6 +22,7 @@ import { parentPort } from 'node:worker_threads';
 import {
   ADDRESS_BYTES,
   CHECKSUM_PREFIX,
+  PUBLIC_KEY_BYTES,
   addressBytesForPublicKey,
   base32Encode,
   generateKeyPair,
@@ -79,7 +80,9 @@ async function runSearch({ raw, stopAfterFirst }) {
   // two-byte 5-bit window lookups in pattern.score() stay in bounds, and the
   // pre-filled SHA3 input ".onion checksum" | PUBKEY | 0x03.
   const bytes = Buffer.allocUnsafe(ADDRESS_BYTES + 1);
-  bytes[ADDRESS_BYTES] = 0;
+  // Bytes 32..35 are only written when the pattern reaches the tail; zero them
+  // once so scoring never reads uninitialized memory for prefix patterns.
+  bytes.subarray(PUBLIC_KEY_BYTES).fill(0);
   const hashInput = Buffer.allocUnsafe(HASH_INPUT_BYTES);
   CHECKSUM_PREFIX.copy(hashInput);
   hashInput[HASH_INPUT_BYTES - 1] = VERSION;
